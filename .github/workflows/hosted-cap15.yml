@@ -1,17 +1,13 @@
-name: Hosted CPU budget
-run-name: Hosted CPU ${{ inputs.mode || '15' }} · ${{ inputs.trial || github.event.pull_request.number }}
+name: Two PRs with eight CPU partitions each
+run-name: Eight CPU partitions for upstream PR ${{ inputs.pull_request }}
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: Partition count, or warm the dependency cache
+      pull_request:
+        description: Upstream PR to replay
         type: choice
-        options: ['15', '6', '20', warm]
-        default: '15'
-      trial:
-        description: Measurement label
-        type: string
-        default: bench
+        required: true
+        options: ['4504', '4491']
 permissions:
   contents: read
 env:
@@ -25,9 +21,9 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 15
+      max-parallel: 8
       matrix:
-        include: ${{ fromJSON(inputs.mode == 'warm' && '[{"part":0,"slot":0}]' || inputs.mode == '6' && '[{"part":0,"slot":0},{"part":1,"slot":1},{"part":2,"slot":2},{"part":3,"slot":3},{"part":4,"slot":4},{"part":5,"slot":5}]' || inputs.mode == '20' && '[{"part":0,"slot":0},{"part":1,"slot":1},{"part":2,"slot":2},{"part":3,"slot":3},{"part":4,"slot":4},{"part":5,"slot":5},{"part":6,"slot":6},{"part":7,"slot":7},{"part":8,"slot":8},{"part":9,"slot":9},{"part":10,"slot":10},{"part":11,"slot":11},{"part":12,"slot":12},{"part":13,"slot":13},{"part":14,"slot":14},{"part":15,"slot":0},{"part":16,"slot":1},{"part":17,"slot":2},{"part":18,"slot":3},{"part":19,"slot":4}]' || '[{"part":0,"slot":0},{"part":1,"slot":1},{"part":2,"slot":2},{"part":3,"slot":3},{"part":4,"slot":4},{"part":5,"slot":5},{"part":6,"slot":6},{"part":7,"slot":7},{"part":8,"slot":8},{"part":9,"slot":9},{"part":10,"slot":10},{"part":11,"slot":11},{"part":12,"slot":12},{"part":13,"slot":13},{"part":14,"slot":14}]') }}
+        slot: ${{ fromJSON(inputs.pull_request == '4504' && '[0,1,2,3,4,5,6,7]' || '[8,9,10,11,12,13,14,15]') }}
     concurrency:
       group: hosted-cpu-budget-slot-${{ matrix.slot }}
       queue: max
@@ -36,7 +32,7 @@ jobs:
         with:
           persist-credentials: false
           repository: sgl-project/sglang-omni
-          ref: 5906e32279f9308564d97e334368172345cf2fa9
+          ref: ${{ inputs.pull_request == '4504' && '57622202bb7d719276594d9250087e179983e9d7' || '9ede4263f9c24ee45593afbfc74f44a7028b4ce1' }}
       - name: Record runner resources
         run: |
           nproc
@@ -74,18 +70,9 @@ jobs:
           git -C "$cosy" checkout --detach 074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc
           git -C "$cosy" submodule update --init --depth=1 third_party/Matcha-TTS
           printf '%s\n' "$PWD/$cosy" "$PWD/$cosy/third_party/Matcha-TTS" > .venv/lib/python3.12/site-packages/cosyvoice.pth
-      - name: Save dependency cache
-        if: inputs.mode == 'warm' && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .venv
-            .uv-python
-          key: hosted-cpu-v1-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
       - name: Run CPU partition
-        if: inputs.mode != 'warm'
         env:
-          PART: ${{ matrix.part }}
+          PART: ${{ strategy.job-index }}
           TOTAL: ${{ strategy.job-total }}
           PYTHONPATH: ${{ github.workspace }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
@@ -93,6 +80,8 @@ jobs:
           uv pip install --python .venv/bin/python --no-build-isolation --no-deps -e .
           source .venv/bin/activate
           mkdir -p results
+          git rev-parse HEAD > results/commit
+          echo "$PART/$TOTAL" > results/partition
           date +%s > results/start
           rc=0
           python -m pytest tests/ -v -m 'not benchmark and not accelerator' \
@@ -106,10 +95,10 @@ jobs:
           tail -n 30 results/pytest.log
           exit "$rc"
       - name: Preserve partition results
-        if: always() && inputs.mode != 'warm'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: part-${{ matrix.part }}
+          name: part-${{ strategy.job-index }}
           path: results/
           if-no-files-found: warn
           retention-days: 5
