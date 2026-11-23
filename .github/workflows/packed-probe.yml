@@ -1,0 +1,40 @@
+name: Two containers on one hosted VM
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: hosted-cpu-budget-slot-14
+      queue: max
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang-omni
+          ref: 5906e32279f9308564d97e334368172345cf2fa9
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: .trial-control
+          persist-credentials: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            .venv
+            .uv-python
+          key: hosted-cpu-v1-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          fail-on-cache-miss: true
+      - name: Compare serial and parallel containers
+        run: |
+          nproc
+          free -h
+          docker version
+          mkdir -p /tmp/empty-docker-context
+          bash .trial-control/bench/packed.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packed
+          path: results/
