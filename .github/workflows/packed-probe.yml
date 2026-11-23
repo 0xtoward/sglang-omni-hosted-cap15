@@ -1,12 +1,23 @@
 name: Two containers on one hosted VM
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      layout:
+        type: choice
+        description: Place both partitions on one VM or give each its own VM
+        options: [packed, separate]
+        default: packed
 permissions:
   contents: read
 jobs:
   probe:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: ${{ fromJSON(inputs.layout == 'separate' && '[12,13]' || '[14]') }}
     concurrency:
-      group: hosted-cpu-budget-slot-14
+      group: hosted-cpu-budget-slot-${{ matrix.slot }}
       queue: max
     timeout-minutes: 35
     steps:
@@ -32,9 +43,9 @@ jobs:
           free -h
           docker version
           mkdir -p /tmp/empty-docker-context
-          bash .trial-control/bench/packed.sh
+          bash .trial-control/bench/packed.sh "${{ matrix.slot }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: packed
+          name: packed-${{ matrix.slot }}
           path: results/

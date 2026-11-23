@@ -27,6 +27,18 @@ run_part() {
     echo "$rc" > "results/$tag.rc"
     tail -n 3 "results/$tag.log"
 }
+if [[ ${1:-14} == 12 || ${1:-14} == 13 ]]; then
+    part=$(( $1 - 12 ))
+    for arm in separate-1 separate-2; do
+        start=$(date +%s)
+        run_part "$arm" "$part" "${masks[0]}"
+        echo "$arm $(( $(date +%s) - start ))" | tee -a results/times
+    done
+    for status in results/*.rc; do
+        [[ $(<"$status") == 0 ]] || exit 1
+    done
+    exit 0
+fi
 for arm in serial-1 parallel-1 parallel-2 serial-2; do
     start=$(date +%s)
     if [[ $arm == serial-* ]]; then
@@ -41,4 +53,6 @@ for arm in serial-1 parallel-1 parallel-2 serial-2; do
     fi
     echo "$arm $(( $(date +%s) - start ))" | tee -a results/times
 done
-! grep -Lx '0' results/*.rc | grep .
+for status in results/*.rc; do
+    [[ $(<"$status") == 0 ]] || exit 1
+done
