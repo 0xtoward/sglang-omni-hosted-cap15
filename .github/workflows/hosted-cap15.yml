@@ -1,0 +1,115 @@
+name: Hosted CPU budget
+run-name: Hosted CPU ${{ inputs.mode || '15' }} · ${{ inputs.trial || github.event.pull_request.number }}
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Partition count, or warm the dependency cache
+        type: choice
+        options: ['15', '6', '20', warm]
+        default: '15'
+      trial:
+        description: Measurement label
+        type: string
+        default: bench
+permissions:
+  contents: read
+env:
+  CUDA_VISIBLE_DEVICES: ''
+  UV_TORCH_BACKEND: cpu
+  UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/.uv-python
+jobs:
+  cpu:
+    name: CPU part ${{ strategy.job-index }} (slot ${{ matrix.slot }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        include: ${{ fromJSON(inputs.mode == 'warm' && '[{"part":0,"slot":0}]' || inputs.mode == '6' && '[{"part":0,"slot":0},{"part":1,"slot":1},{"part":2,"slot":2},{"part":3,"slot":3},{"part":4,"slot":4},{"part":5,"slot":5}]' || inputs.mode == '20' && '[{"part":0,"slot":0},{"part":1,"slot":1},{"part":2,"slot":2},{"part":3,"slot":3},{"part":4,"slot":4},{"part":5,"slot":5},{"part":6,"slot":6},{"part":7,"slot":7},{"part":8,"slot":8},{"part":9,"slot":9},{"part":10,"slot":10},{"part":11,"slot":11},{"part":12,"slot":12},{"part":13,"slot":13},{"part":14,"slot":14},{"part":15,"slot":0},{"part":16,"slot":1},{"part":17,"slot":2},{"part":18,"slot":3},{"part":19,"slot":4}]' || '[{"part":0,"slot":0},{"part":1,"slot":1},{"part":2,"slot":2},{"part":3,"slot":3},{"part":4,"slot":4},{"part":5,"slot":5},{"part":6,"slot":6},{"part":7,"slot":7},{"part":8,"slot":8},{"part":9,"slot":9},{"part":10,"slot":10},{"part":11,"slot":11},{"part":12,"slot":12},{"part":13,"slot":13},{"part":14,"slot":14}]') }}
+    concurrency:
+      group: hosted-cpu-budget-slot-${{ matrix.slot }}
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: sgl-project/sglang-omni
+          ref: 5906e32279f9308564d97e334368172345cf2fa9
+      - name: Record runner resources
+        run: |
+          nproc
+          free -h
+          df -h /
+          if [ "$(df -BG --output=avail / | tail -1 | tr -dc '0-9')" -lt 25 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          fi
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Restore CPU environment
+        uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            .venv
+            .uv-python
+          key: hosted-cpu-v1-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+      - name: Install system tools
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v sox >/dev/null; then
+            sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update -qq
+            sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y -qq ffmpeg sox
+          fi
+      - name: Build CPU environment
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e '.[minicpm-o,fun-cosyvoice3]'
+          uv pip install --python .venv/bin/python descript-audio-codec==1.0.0 descript-audiotools==0.7.2
+          uv pip install --python .venv/bin/python --no-deps qwen-tts==0.1.1
+          cosy=.venv/src/CosyVoice
+          git clone --filter=blob:none --no-checkout https://github.com/FunAudioLLM/CosyVoice.git "$cosy"
+          git -C "$cosy" checkout --detach 074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc
+          git -C "$cosy" submodule update --init --depth=1 third_party/Matcha-TTS
+          printf '%s\n' "$PWD/$cosy" "$PWD/$cosy/third_party/Matcha-TTS" > .venv/lib/python3.12/site-packages/cosyvoice.pth
+      - name: Save dependency cache
+        if: inputs.mode == 'warm' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .venv
+            .uv-python
+          key: hosted-cpu-v1-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+      - name: Run CPU partition
+        if: inputs.mode != 'warm'
+        env:
+          PART: ${{ matrix.part }}
+          TOTAL: ${{ strategy.job-total }}
+          PYTHONPATH: ${{ github.workspace }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          uv pip install --python .venv/bin/python --no-build-isolation --no-deps -e .
+          source .venv/bin/activate
+          mkdir -p results
+          date +%s > results/start
+          rc=0
+          python -m pytest tests/ -v -m 'not benchmark and not accelerator' \
+            --continue-on-collection-errors -p scripts.ci.utils.pytest_partition \
+            --auto-partition-id "$PART" --auto-partition-size "$TOTAL" \
+            --partition-model-file .github/unit_test_durations.json \
+            --junitxml=results/junit.xml --durations=10 > results/pytest.log 2>&1 || rc=$?
+          date +%s > results/end
+          echo "$rc" > results/status
+          echo "$CACHE_HIT" > results/cache
+          tail -n 30 results/pytest.log
+          exit "$rc"
+      - name: Preserve partition results
+        if: always() && inputs.mode != 'warm'
+        uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 5
