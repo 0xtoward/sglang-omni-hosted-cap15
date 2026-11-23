@@ -4,7 +4,7 @@ mkdir -p results
 image=hosted-test-os
 docker build -t "$image" -f - /tmp/empty-docker-context <<'DOCKER'
 FROM ubuntu:24.04
-RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates ffmpeg sox git libgomp1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates ffmpeg sox git libgomp1 python3.12 && rm -rf /var/lib/apt/lists/*
 DOCKER
 python_home=$(.venv/bin/python -c 'import sys;print(sys.base_prefix)')
 mounts=(-v "$PWD:$PWD:ro" -v "$PWD/results:/results" -w "$PWD")
