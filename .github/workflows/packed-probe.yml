@@ -5,7 +5,7 @@ on:
       layout:
         type: choice
         description: Place both partitions on one VM or give each its own VM
-        options: [packed, separate]
+        options: [packed, separate, startup]
         default: packed
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slot: ${{ fromJSON(inputs.layout == 'separate' && '[12,13]' || '[14]') }}
+        slot: ${{ fromJSON(inputs.layout == 'separate' && '[12,13]' || inputs.layout == 'startup' && '[12]' || '[14]') }}
     concurrency:
       group: hosted-cpu-budget-slot-${{ matrix.slot }}
       queue: max
@@ -43,7 +43,7 @@ jobs:
           free -h
           docker version
           mkdir -p /tmp/empty-docker-context
-          bash .trial-control/bench/packed.sh "${{ matrix.slot }}"
+          bash .trial-control/bench/packed.sh "${{ matrix.slot }}" "${{ inputs.layout }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

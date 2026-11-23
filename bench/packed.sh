@@ -27,6 +27,17 @@ run_part() {
     echo "$rc" > "results/$tag.rc"
     tail -n 3 "results/$tag.log"
 }
+if [[ ${2:-} == startup ]]; then
+    files=(tests/unit_test/pipeline/test_native_child_processes.py tests/unit_test/pipeline/test_process_failure.py::test_worker_hard_exit_errors_http_requests_and_terminates_blocked_peer)
+    mounts+=(-v "$PWD/.venv:$PWD/.venv:rw")
+    /usr/bin/time -f '%e seconds' docker run --rm "${mounts[@]}" -e PYTHONPATH="$PWD" "$image" \
+        .venv/bin/python -c 'import sglang_omni.pipeline.stage_workers' 2> results/first-import.log
+    /usr/bin/time -f '%e seconds' docker run --rm "${mounts[@]}" -e PYTHONPATH="$PWD" "$image" \
+        .venv/bin/python -c 'import sglang_omni.pipeline.stage_workers' 2> results/warm-import.log
+    docker run --rm "${mounts[@]}" -e PYTHONPATH="$PWD" "$image" .venv/bin/python -m pytest "${files[@]}" \
+        -v -p no:cacheprovider --junitxml=/results/startup.xml > results/startup.log 2>&1
+    exit 0
+fi
 if [[ ${1:-14} == 12 || ${1:-14} == 13 ]]; then
     part=$(( $1 - 12 ))
     for arm in separate-1 separate-2; do
