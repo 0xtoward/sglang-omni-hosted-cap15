@@ -1,0 +1,634 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Audio encoding utilities.
+
+Converts raw audio data (numpy arrays, torch tensors, or raw bytes) into
+various output formats (WAV, MP3, FLAC, etc.) for API responses.
+"""
+
+from __future__ import annotations
+
+import base64
+import importlib.util
+import io
+import logging
+import shutil
+import struct
+from dataclasses import dataclass
+from functools import cache
+
+import numpy as np
+import soxr
+
+logger = logging.getLogger(__name__)
+
+# Supported output formats and their MIME types
+FORMAT_MIME_TYPES: dict[str, str] = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "flac": "audio/flac",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "pcm": "audio/pcm",
+}
+
+# Default sample rate for generated audio
+DEFAULT_SAMPLE_RATE = 24000
+# note (ratish): The speech rate floor preserves the lowest supported AAC rate.
+MIN_AUDIO_OUTPUT_SAMPLE_RATE = 7350
+MAX_AUDIO_OUTPUT_SAMPLE_RATE = 192000
+OPUS_PLAYBACK_SAMPLE_RATE = 48000
+# note (ratish): FLAC's streamable subset uses 10 Hz units above the 16-bit Hz field's limit.
+FLAC_MAX_UNSCALED_SAMPLE_RATE_HZ = 65535
+FLAC_SCALED_SAMPLE_RATE_UNIT_HZ = 10
+
+
+# Configurations for PyAV encoding
+PYAV_ENCODE_CONFIGS = {
+    "opus": {
+        "container": "ogg",
+        "codecs": ("libopus", "opus"),
+        "valid_rates": {8000, 12000, 16000, 24000, 48000},
+    },
+    "aac": {
+        "container": "adts",
+        "codecs": ("aac",),
+        "valid_rates": {
+            7350,
+            8000,
+            11025,
+            12000,
+            16000,
+            22050,
+            24000,
+            32000,
+            44100,
+            48000,
+            64000,
+            88200,
+            96000,
+        },
+    },
+    "mp3": {
+        "container": "mp3",
+        "codecs": ("libmp3lame", "mp3"),
+        "valid_rates": {
+            8000,
+            11025,
+            12000,
+            16000,
+            22050,
+            24000,
+            32000,
+            44100,
+            48000,
+        },
+    },
+}
+
+
+@dataclass(kw_only=True)
+class EncodedAudio:
+    """Encoded audio and the metadata describing its payload."""
+
+    audio_bytes: bytes
+    mime_type: str
+    sample_rate: int
+
+
+def audio_output_sample_rate_error(
+    response_format: str, output_sample_rate: int | None
+) -> str | None:
+    """Explain why an encoder cannot honor the requested output rate."""
+    if output_sample_rate is None:
+        return None
+    elif isinstance(output_sample_rate, bool) or not isinstance(
+        output_sample_rate, int
+    ):
+        return "sample_rate must be an integer"
+    elif output_sample_rate < MIN_AUDIO_OUTPUT_SAMPLE_RATE:
+        return f"sample_rate must be at least {MIN_AUDIO_OUTPUT_SAMPLE_RATE}"
+    elif output_sample_rate > MAX_AUDIO_OUTPUT_SAMPLE_RATE:
+        return f"sample_rate must be at most {MAX_AUDIO_OUTPUT_SAMPLE_RATE}"
+    elif response_format == "opus" and output_sample_rate != OPUS_PLAYBACK_SAMPLE_RATE:
+        return f"sample_rate must be {OPUS_PLAYBACK_SAMPLE_RATE} for Opus output"
+    elif (
+        response_format == "flac"
+        and output_sample_rate > FLAC_MAX_UNSCALED_SAMPLE_RATE_HZ
+        and output_sample_rate % FLAC_SCALED_SAMPLE_RATE_UNIT_HZ != 0
+    ):
+        return (
+            f"sample_rate for FLAC above {FLAC_MAX_UNSCALED_SAMPLE_RATE_HZ} Hz "
+            f"must be divisible by {FLAC_SCALED_SAMPLE_RATE_UNIT_HZ}"
+        )
+    elif (
+        response_format in PYAV_ENCODE_CONFIGS
+        and output_sample_rate
+        not in PYAV_ENCODE_CONFIGS[response_format]["valid_rates"]
+    ):
+        supported_rates = sorted(PYAV_ENCODE_CONFIGS[response_format]["valid_rates"])
+        return f"sample_rate for {response_format} must be one of: {supported_rates}"
+    else:
+        return None
+
+
+@cache
+def audio_encoding_unavailable_reason(response_format: str) -> str | None:
+    """Return why the requested response format cannot be encoded."""
+
+    if response_format == "flac":
+        if importlib.util.find_spec("soundfile") is None:
+            return "soundfile is required for response_format='flac'"
+        else:
+            pass
+        return None
+    else:
+        pass
+
+    if response_format not in PYAV_ENCODE_CONFIGS:
+        return None
+    else:
+        pass
+
+    if importlib.util.find_spec("av") is not None:
+        return None
+    else:
+        pass
+
+    if importlib.util.find_spec("pydub") is None:
+        return "PyAV or pydub is required for " f"response_format={response_format!r}"
+    else:
+        pass
+
+    if shutil.which("ffmpeg") is None and shutil.which("avconv") is None:
+        return (
+            "PyAV, ffmpeg, or avconv is required for "
+            f"response_format={response_format!r}"
+        )
+    else:
+        pass
+
+    return None
+
+
+def to_numpy(
+    audio: object,
+) -> np.ndarray:
+    """Convert audio data to a numpy float32 array.
+
+    Accepts:
+    - numpy ndarray
+    - torch Tensor
+    - list / tuple of numbers
+    - bytes (assumed 16-bit PCM)
+    """
+    if isinstance(audio, np.ndarray):
+        return audio.astype(np.float32, copy=False)
+    else:
+        pass
+
+    # torch Tensor
+    if hasattr(audio, "cpu") and hasattr(audio, "numpy"):
+        arr = audio.detach().cpu().float().numpy()
+        return arr.astype(np.float32, copy=False)
+    else:
+        pass
+
+    if isinstance(audio, (list, tuple)):
+        return np.array(audio, dtype=np.float32)
+    else:
+        pass
+
+    if isinstance(audio, bytes):
+        # Assume 16-bit signed PCM
+        arr = np.frombuffer(audio, dtype="<i2")
+        return (arr.astype(np.float32) / 32768.0).astype(np.float32)
+    else:
+        pass
+
+    raise TypeError(f"Unsupported audio type: {type(audio)}")
+
+
+def apply_speed(
+    audio: np.ndarray, speed: float, sample_rate: int
+) -> tuple[np.ndarray, int]:
+    """Apply speed adjustment by resampling.
+
+    Returns (adjusted_audio, adjusted_sample_rate).
+
+    Raises:
+        ValueError: If *speed* is zero or negative.
+    """
+    if speed <= 0.0:
+        raise ValueError(f"speed must be positive, got {speed}")
+    else:
+        pass
+    if speed == 1.0:
+        return audio, sample_rate
+    else:
+        pass
+
+    # Speed up/slow down by changing the effective sample rate
+    # Then resample to the original rate
+    new_length = max(int(round(len(audio) / speed)), 1)
+    old_idx = np.arange(len(audio), dtype=np.float64)
+    new_idx = np.linspace(0.0, len(audio) - 1, num=new_length, dtype=np.float64)
+    resampled = np.interp(new_idx, old_idx, audio).astype(np.float32)
+    return resampled, sample_rate
+
+
+def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Encode audio as a WAV file (16-bit PCM)."""
+    # Clamp to [-1, 1]
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype(np.int16)
+    if pcm.ndim == 2:
+        num_channels = int(pcm.shape[0])
+        pcm_bytes = np.ascontiguousarray(pcm.T).tobytes()
+    else:
+        num_channels = 1
+        pcm_bytes = pcm.tobytes()
+
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    data_size = len(pcm_bytes)
+
+    buf = io.BytesIO()
+    # RIFF header
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    # fmt chunk
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<I", 16))  # chunk size
+    buf.write(
+        struct.pack(
+            "<HHIIHH",
+            1,
+            num_channels,
+            sample_rate,
+            byte_rate,
+            block_align,
+            bits_per_sample,
+        )
+    )
+    # data chunk
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    buf.write(pcm_bytes)
+
+    return buf.getvalue()
+
+
+def resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return audio.astype(np.float32, copy=False)
+    else:
+        pass
+    if audio.size == 0:
+        return audio.astype(np.float32, copy=False)
+    else:
+        pass
+    sample_count = audio.shape[-1]
+    duration = sample_count / float(orig_sr)
+    new_len = max(int(round(duration * target_sr)), 1)
+    old_idx = np.arange(sample_count, dtype=np.float64)
+    new_idx = np.linspace(0.0, sample_count - 1, num=new_len, dtype=np.float64)
+    if audio.ndim == 1:
+        return np.interp(new_idx, old_idx, audio).astype(np.float32)
+    else:
+        pass
+
+    channels = audio.reshape(-1, sample_count)
+    resampled = np.stack([np.interp(new_idx, old_idx, channel) for channel in channels])
+    return resampled.reshape(audio.shape[:-1] + (new_len,)).astype(np.float32)
+
+
+def encode_with_pyav(
+    audio: np.ndarray,
+    sample_rate: int,
+    container_format: str,
+    codecs: tuple[str, ...],
+) -> bytes:
+    import av
+
+    buf = io.BytesIO()
+    container = av.open(buf, mode="w", format=container_format)
+
+    stream = None
+    for codec in codecs:
+        try:
+            stream = container.add_stream(codec, rate=sample_rate)
+            break
+        except av.CodecError:
+            continue
+
+    if stream is None:
+        container.close()
+        codecs_str = "', '".join(codecs)
+        raise RuntimeError(
+            f"None of the codecs ('{codecs_str}') are supported by PyAV."
+        )
+    else:
+        pass
+
+    if audio.ndim == 1:
+        layout = "mono"
+        planar_audio = audio.reshape(1, -1)
+    elif audio.ndim == 2 and audio.shape[0] in (1, 2):
+        channels = int(audio.shape[0])
+        layout = "mono" if channels == 1 else "stereo"
+        planar_audio = audio
+    else:
+        raise ValueError(
+            "PyAV encoding supports mono or stereo channel-first audio, "
+            f"got shape {audio.shape}"
+        )
+
+    planar_audio = np.ascontiguousarray(planar_audio, dtype=np.float32)
+    stream.layout = layout
+
+    # FFmpeg expects float-planar (fltp) format for these codecs
+    frame = av.AudioFrame.from_ndarray(planar_audio, format="fltp", layout=layout)
+    frame.sample_rate = sample_rate
+
+    for packet in stream.encode(frame):
+        container.mux(packet)
+
+    for packet in stream.encode(None):
+        container.mux(packet)
+
+    container.close()
+    return buf.getvalue()
+
+
+def encode_pcm(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Encode audio as raw 16-bit PCM bytes."""
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype(np.int16)
+    if pcm.ndim == 2:
+        pcm = np.ascontiguousarray(pcm.T)
+    else:
+        pass
+    return pcm.tobytes()
+
+
+def select_audio_delta(
+    audio_data: object,
+    *,
+    emitted_samples: int,
+    is_terminal: bool,
+) -> tuple[np.ndarray | None, int]:
+    """Return the un-emitted audio delta from a streaming audio chunk."""
+
+    audio = to_numpy(audio_data)
+    if audio.ndim > 1:
+        audio = audio.squeeze()
+    else:
+        pass
+    if audio.ndim > 1:
+        # Streaming chunks are mono; downmix multi-channel payloads
+        # (e.g. the 48 kHz stereo MOSS-TTS Local codec) instead of
+        # silently dropping channels.
+        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
+        audio = audio.mean(axis=channel_axis).astype("float32")
+    else:
+        pass
+
+    total_samples = int(audio.shape[-1]) if audio.ndim else 0
+    if not is_terminal:
+        return audio, emitted_samples + total_samples
+    else:
+        pass
+    if total_samples <= emitted_samples:
+        return None, emitted_samples
+    else:
+        pass
+    return audio[emitted_samples:], total_samples
+
+
+def encode_audio(
+    audio: object,
+    *,
+    response_format: str = "wav",
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    output_sample_rate: int | None = None,
+    speed: float = 1.0,
+    allow_format_fallback: bool = True,
+) -> EncodedAudio:
+    """Encode audio data to the requested format.
+
+    Args:
+        audio: Raw audio data (numpy, torch tensor, list, bytes)
+        response_format: Target format (wav, mp3, flac, opus, aac, pcm)
+        sample_rate: Audio sample rate in Hz
+        output_sample_rate: Requested encoded sample rate in Hz
+        speed: Speed adjustment factor (1.0 = normal)
+        allow_format_fallback: If True, return WAV when a compressed encoder is
+            unavailable or the format is unknown. If False, raise ValueError.
+
+    Returns:
+        Encoded audio bytes, MIME type, and actual output sample rate in Hz.
+    """
+    fmt = response_format.lower().strip()
+    sample_rate_error = audio_output_sample_rate_error(fmt, output_sample_rate)
+    if sample_rate_error is not None:
+        raise ValueError(sample_rate_error)
+    else:
+        pass
+    arr = to_numpy(audio)
+
+    if arr.ndim > 1:
+        arr = arr.squeeze()
+    else:
+        pass
+    if arr.ndim > 1:
+        if arr.shape[0] > arr.shape[-1]:
+            arr = arr.T
+        else:
+            pass
+        # note(chenye): Preserve native stereo for supported non-WAV formats;
+        # keep the historical mono behavior for raw PCM and unsupported
+        # channel layouts.
+        if fmt != "wav" and (
+            fmt not in ("mp3", "flac", "opus", "aac") or arr.shape[0] != 2
+        ):
+            arr = arr.mean(axis=0).astype(np.float32)
+        else:
+            pass
+    else:
+        pass
+
+    if speed != 1.0:
+        if arr.ndim > 1:
+            adjusted = [apply_speed(channel, speed, sample_rate) for channel in arr]
+            arr = np.stack([channel for channel, _ in adjusted])
+            sample_rate = adjusted[0][1]
+        else:
+            arr, sample_rate = apply_speed(arr, speed, sample_rate)
+    else:
+        pass
+
+    if output_sample_rate is not None and output_sample_rate != sample_rate:
+        arr = soxr.resample(arr.T, sample_rate, output_sample_rate).T
+        sample_rate = output_sample_rate
+    else:
+        pass
+    if output_sample_rate is not None and arr.size == 0:
+        raise ValueError("No audio samples remain at the requested output sample rate")
+    else:
+        pass
+
+    mime = FORMAT_MIME_TYPES.get(fmt, "application/octet-stream")
+
+    if fmt == "wav":
+        return EncodedAudio(
+            audio_bytes=encode_wav(arr, sample_rate),
+            mime_type=mime,
+            sample_rate=sample_rate,
+        )
+    else:
+        pass
+
+    if fmt == "pcm":
+        return EncodedAudio(
+            audio_bytes=encode_pcm(arr, sample_rate),
+            mime_type=mime,
+            sample_rate=sample_rate,
+        )
+    else:
+        pass
+
+    if fmt in ("opus", "aac", "mp3"):
+        config = PYAV_ENCODE_CONFIGS[fmt]
+        encoder_sample_rate = min(
+            config["valid_rates"],
+            key=lambda supported_sample_rate: abs(supported_sample_rate - sample_rate),
+        )
+        encoder_audio = resample_linear(arr, sample_rate, encoder_sample_rate)
+        encoded_sample_rate = (
+            OPUS_PLAYBACK_SAMPLE_RATE if fmt == "opus" else encoder_sample_rate
+        )
+        try:
+            encoded_bytes = encode_with_pyav(
+                encoder_audio,
+                encoder_sample_rate,
+                container_format=config["container"],
+                codecs=config["codecs"],
+            )
+            return EncodedAudio(
+                audio_bytes=encoded_bytes,
+                mime_type=mime,
+                sample_rate=encoded_sample_rate,
+            )
+        except Exception as e:
+            logger.warning(
+                f"PyAV {fmt.upper()} encoding failed ({e}); falling back to pydub/WAV"
+            )
+
+        try:
+            from pydub import AudioSegment
+
+            wav_bytes = encode_wav(encoder_audio, encoder_sample_rate)
+            seg = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+            buf = io.BytesIO()
+            export_fmt = {"aac": "adts", "opus": "opus"}.get(fmt, fmt)
+            seg.export(
+                buf, format=export_fmt, parameters=["-ar", str(encoder_sample_rate)]
+            )
+            return EncodedAudio(
+                audio_bytes=buf.getvalue(),
+                mime_type=mime,
+                sample_rate=encoded_sample_rate,
+            )
+        except ImportError:
+            if not allow_format_fallback:
+                raise ValueError(f"pydub is required to encode response_format={fmt!r}")
+            else:
+                pass
+            logger.warning(
+                f"pydub not installed; falling back to WAV for {fmt} request"
+            )
+            return EncodedAudio(
+                audio_bytes=encode_wav(arr, sample_rate),
+                mime_type=FORMAT_MIME_TYPES["wav"],
+                sample_rate=sample_rate,
+            )
+        except Exception as exc:
+            if not allow_format_fallback:
+                raise ValueError(
+                    f"Failed to encode response_format={fmt!r}: {exc}"
+                ) from exc
+            else:
+                pass
+            logger.warning(
+                f"Failed to encode {fmt}; falling back to WAV", exc_info=True
+            )
+            return EncodedAudio(
+                audio_bytes=encode_wav(arr, sample_rate),
+                mime_type=FORMAT_MIME_TYPES["wav"],
+                sample_rate=sample_rate,
+            )
+    else:
+        pass
+
+    if fmt == "flac":
+        try:
+            import soundfile as sf
+
+            buf = io.BytesIO()
+            soundfile_audio = arr.T if arr.ndim == 2 else arr
+            sf.write(
+                buf,
+                np.ascontiguousarray(soundfile_audio),
+                sample_rate,
+                format="FLAC",
+            )
+            return EncodedAudio(
+                audio_bytes=buf.getvalue(), mime_type=mime, sample_rate=sample_rate
+            )
+        except ImportError:
+            if not allow_format_fallback:
+                raise ValueError(
+                    "soundfile is required to encode response_format='flac'"
+                )
+            else:
+                pass
+            logger.warning(
+                "soundfile not installed; falling back to WAV for FLAC request"
+            )
+            return EncodedAudio(
+                audio_bytes=encode_wav(arr, sample_rate),
+                mime_type=FORMAT_MIME_TYPES["wav"],
+                sample_rate=sample_rate,
+            )
+    else:
+        pass
+
+    if not allow_format_fallback:
+        raise ValueError(f"Unsupported audio format: {response_format!r}")
+    else:
+        pass
+    logger.warning(f"Unknown audio format '{fmt}'; falling back to WAV")
+    return EncodedAudio(
+        audio_bytes=encode_wav(arr, sample_rate),
+        mime_type=FORMAT_MIME_TYPES["wav"],
+        sample_rate=sample_rate,
+    )
+
+
+def audio_to_base64(
+    audio: object,
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    output_format: str = "wav",
+) -> str:
+    """Encode audio data to a base64 string.
+
+    Useful for embedding audio in JSON responses (e.g. chat completions
+    with audio modality).
+    """
+    encoded_audio = encode_audio(
+        audio, response_format=output_format, sample_rate=sample_rate
+    )
+    return base64.b64encode(encoded_audio.audio_bytes).decode("ascii")

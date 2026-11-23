@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import huggingface_hub
+import pytest
+
+from sglang_omni.utils.checkpoint import resolve_checkpoint
+
+
+def test_resolve_checkpoint_returns_local_directory(tmp_path) -> None:
+    assert resolve_checkpoint(str(tmp_path)) == str(tmp_path)
+
+
+def test_resolve_checkpoint_downloads_latest_without_pin(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_snapshot_download(repo_id, revision=None):
+        captured.update({"repo_id": repo_id, "revision": revision})
+        return "/snapshots/latest"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    assert resolve_checkpoint("org/model") == "/snapshots/latest"
+    assert captured == {"repo_id": "org/model", "revision": None}
+
+
+def test_resolve_checkpoint_honors_pinned_revision(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_snapshot_download(repo_id, revision=None):
+        captured.update({"repo_id": repo_id, "revision": revision})
+        return "/snapshots/pinned"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    assert resolve_checkpoint("org/model@abc123") == "/snapshots/pinned"
+    assert captured == {"repo_id": "org/model", "revision": "abc123"}
+
+
+def test_pinned_spec_resolves_architecture_without_snapshot(
+    monkeypatch, tmp_path
+) -> None:
+    from types import SimpleNamespace
+
+    from sglang_omni.config import manager
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    def fail_snapshot(*args, **kwargs):
+        raise AssertionError("architecture discovery must not download weights")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fail_snapshot)
+    captured: dict[str, object] = {}
+
+    def fake_auto_config(path, revision=None, **kwargs):
+        captured["auto"] = (path, revision)
+        raise OSError("metadata offline in this test")
+
+    monkeypatch.setattr(
+        manager,
+        "AutoConfig",
+        SimpleNamespace(from_pretrained=fake_auto_config),
+    )
+
+    def fake_hub_download(repo_id, filename, revision=None, **kwargs):
+        captured["raw"] = (repo_id, filename, revision)
+        path = tmp_path / filename
+        path.write_text('{"architectures": ["DotsTTSForConditionalGeneration"]}')
+        return str(path)
+
+    monkeypatch.setattr("sglang_omni.utils.hf.hf_hub_download", fake_hub_download)
+
+    config_cls = manager.resolve_config_cls_for_model_path(
+        "dots-studio/dots.tts-mf@c28105adc8228143392b4e346994ff613ee48a06"
+    )
+
+    assert config_cls is DotsTTSPipelineConfig
+    revision = "c28105adc8228143392b4e346994ff613ee48a06"
+    assert captured["auto"] == ("dots-studio/dots.tts-mf", revision)
+    assert captured["raw"] == ("dots-studio/dots.tts-mf", "config.json", revision)
+
+
+def test_unresolvable_pinned_spec_names_the_revision(monkeypatch) -> None:
+    import pytest
+
+    from sglang_omni.config import manager
+
+    def fail_metadata(*args, **kwargs):
+        raise OSError("metadata offline in this test")
+
+    monkeypatch.setattr(manager.AutoConfig, "from_pretrained", fail_metadata)
+    monkeypatch.setattr("sglang_omni.utils.hf.hf_hub_download", fail_metadata)
+
+    with pytest.raises(ValueError, match="check that revision c28105ad"):
+        manager.resolve_config_cls_for_model_path("org/model@c28105ad")
+    with pytest.raises(ValueError) as unpinned:
+        manager.resolve_config_cls_for_model_path("org/model")
+    assert "revision" not in str(unpinned.value)
+
+
+@pytest.mark.parametrize(
+    "architecture, config_cls_path",
+    [
+        (
+            "DotsTTSForConditionalGeneration",
+            "sglang_omni.models.dots_tts.config.DotsTTSPipelineConfig",
+        ),
+        (
+            "NEOChatModel",
+            "sglang_omni.models.sensenova_u1.config.SenseNovaU1PipelineConfig",
+        ),
+    ],
+)
+def test_local_model_path_skips_snapshot_resolution(
+    monkeypatch, tmp_path, architecture: str, config_cls_path: str
+) -> None:
+    from sglang_omni.config import manager
+
+    def fail_snapshot(*args, **kwargs):
+        raise AssertionError("local paths must not resolve a snapshot")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fail_snapshot)
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda *args: prompts.append(args) or "n")
+    (tmp_path / "config.json").write_text(
+        f'{{"architectures": ["{architecture}"], "model_type": "custom",'
+        ' "auto_map": {"AutoConfig": "configuration_custom.CustomConfig"}}'
+    )
+
+    config_cls = manager.resolve_config_cls_for_model_path(str(tmp_path))
+
+    assert f"{config_cls.__module__}.{config_cls.__qualname__}" == config_cls_path
+    assert prompts == []
