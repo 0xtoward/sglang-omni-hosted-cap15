@@ -27,15 +27,35 @@ run_part() {
     echo "$rc" > "results/$tag.rc"
     tail -n 3 "results/$tag.log"
 }
-if [[ ${2:-} == startup ]]; then
-    files=(tests/unit_test/pipeline/test_native_child_processes.py tests/unit_test/pipeline/test_process_failure.py::test_worker_hard_exit_errors_http_requests_and_terminates_blocked_peer)
+if [[ ${2:-} == startup || ${2:-} == warmed ]]; then
     mounts+=(-v "$PWD/.venv:$PWD/.venv:rw")
     /usr/bin/time -f '%e seconds' docker run --rm "${mounts[@]}" -e PYTHONPATH="$PWD" "$image" \
         .venv/bin/python -c 'import sglang_omni.pipeline.stage_workers' 2> results/first-import.log
+fi
+if [[ ${2:-} == startup ]]; then
+    files=(tests/unit_test/pipeline/test_native_child_processes.py tests/unit_test/pipeline/test_process_failure.py::test_worker_hard_exit_errors_http_requests_and_terminates_blocked_peer)
     /usr/bin/time -f '%e seconds' docker run --rm "${mounts[@]}" -e PYTHONPATH="$PWD" "$image" \
         .venv/bin/python -c 'import sglang_omni.pipeline.stage_workers' 2> results/warm-import.log
     docker run --rm "${mounts[@]}" -e PYTHONPATH="$PWD" "$image" .venv/bin/python -m pytest "${files[@]}" \
         -v -p no:cacheprovider --junitxml=/results/startup.xml > results/startup.log 2>&1
+    exit 0
+fi
+if [[ ${2:-} == warmed ]]; then
+    start=$(date +%s)
+    if [[ $1 == 14 ]]; then
+        run_part warmed 0 "${masks[1]}" &
+        first=$!
+        run_part warmed 1 "${masks[2]}" &
+        second=$!
+        wait "$first"
+        wait "$second"
+    else
+        run_part warmed "$(( $1 - 12 ))" "${masks[0]}"
+    fi
+    echo "$start $(date +%s)" > results/interval
+    for status in results/*.rc; do
+        [[ $(<"$status") == 0 ]] || exit 1
+    done
     exit 0
 fi
 if [[ ${1:-14} == 12 || ${1:-14} == 13 ]]; then

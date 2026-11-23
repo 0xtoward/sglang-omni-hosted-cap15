@@ -5,7 +5,7 @@ on:
       layout:
         type: choice
         description: Place both partitions on one VM or give each its own VM
-        options: [packed, separate, startup]
+        options: [packed, separate, startup, warmed]
         default: packed
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slot: ${{ fromJSON(inputs.layout == 'separate' && '[12,13]' || inputs.layout == 'startup' && '[12]' || '[14]') }}
+        slot: ${{ fromJSON(inputs.layout == 'warmed' && '[12,13,14]' || inputs.layout == 'separate' && '[12,13]' || inputs.layout == 'startup' && '[12]' || '[14]') }}
     concurrency:
       group: hosted-cpu-budget-slot-${{ matrix.slot }}
       queue: max
